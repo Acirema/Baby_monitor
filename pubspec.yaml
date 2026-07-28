@@ -1,0 +1,27 @@
+name: video_monitor
+description: Server/Client video & audio monitor with sound and motion detection alerts.
+publish_to: 'none'
+version: 1.0.0+1
+# Licensed under the MIT License — see LICENSE file. Free for commercial use.
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_webrtc: ^1.5.2
+  permission_handler: ^11.3.1
+  provider: ^6.1.2
+  image: ^4.2.0
+  noise_meter: ^5.0.1
+  network_info_plus: ^5.0.3
+  cryptography: ^2.7.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
