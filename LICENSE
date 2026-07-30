@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 Your Company/Name
+Copyright (c) 2026 Acirema
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -32,5 +32,3 @@ their license files under `.dart_tool/`/`pub-cache` — review those if you
 redistribute the compiled app, as most permissive licenses require keeping
 their copyright notices in distributed binaries/attribution screens.
 
-Replace "Your Company/Name" above with your actual company or personal name
-before shipping commercially.
