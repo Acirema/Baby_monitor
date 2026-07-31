@@ -1,4 +1,3 @@
-// Copyright (c) 2026 Your Company/Name.
 // Licensed under the MIT License — see LICENSE for details.
 
 import 'dart:async';
@@ -8,6 +7,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../models/detection_event.dart';
 import '../services/keep_alive_service.dart';
@@ -16,6 +17,12 @@ import '../services/signaling.dart';
 import '../services/webrtc_service.dart';
 import '../widgets/alert_popup.dart';
 import '../widgets/fullscreen_video.dart';
+
+/// If the connection drops unexpectedly, keep retrying for this long before
+/// giving up and surfacing "disconnected" to the user.
+const Duration kReconnectGiveUpTimeout = Duration(minutes: 5);
+const Duration kReconnectRetryInterval = Duration(seconds: 5);
+const String kLastIpPrefKey = 'video_monitor_last_server_ip';
 
 class ClientScreen extends StatefulWidget {
   const ClientScreen({super.key});
@@ -40,6 +47,10 @@ class _ClientScreenState extends State<ClientScreen> {
   bool _connecting = false;
   bool _connected = false;
   bool _stayActive = false;
+  bool _manualDisconnect = true;
+  bool _autoRetrying = false;
+  Timer? _reconnectTimer;
+  DateTime? _reconnectDeadline;
   final List<DetectionEvent> _log = [];
 
   @override
@@ -47,9 +58,18 @@ class _ClientScreenState extends State<ClientScreen> {
     super.initState();
     _remoteRenderer.initialize();
     Permission.microphone.request(); // for playback audio focus on some platforms
+    _loadLastIp();
   }
 
-  Future<void> _connect() async {
+  Future<void> _loadLastIp() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(kLastIpPrefKey);
+    if (saved != null && mounted) {
+      setState(() => _ipController.text = saved);
+    }
+  }
+
+  Future<void> _connect({bool isReconnect = false}) async {
     final ip = _ipController.text.trim();
     final code = _accessCodeController.text.trim();
     if (ip.isEmpty || code.isEmpty) {
@@ -57,18 +77,23 @@ class _ClientScreenState extends State<ClientScreen> {
       return;
     }
 
-    setState(() {
-      _connecting = true;
-      _status = 'Connecting to $ip:$defaultSignalingPort ...';
-    });
+    if (!isReconnect) {
+      _manualDisconnect = false;
+      _reconnectDeadline = null;
+      _autoRetrying = false;
+      _reconnectTimer?.cancel();
+      _reconnectTimer = null;
+      setState(() => _connecting = true);
+    }
+    setState(() => _status = isReconnect
+        ? 'Reconnecting to $ip:$defaultSignalingPort ...'
+        : 'Connecting to $ip:$defaultSignalingPort ...');
 
     try {
       _socket = await Socket.connect(ip, defaultSignalingPort, timeout: const Duration(seconds: 8));
     } catch (e) {
-      setState(() {
-        _connecting = false;
-        _status = 'Could not connect: $e';
-      });
+      if (!isReconnect) setState(() => _connecting = false);
+      _scheduleReconnectOrGiveUp('Could not connect: $e');
       return;
     }
 
@@ -79,14 +104,24 @@ class _ClientScreenState extends State<ClientScreen> {
     try {
       await secure.authenticateAsClient(code);
     } catch (e) {
-      setState(() {
-        _connecting = false;
-        _status = 'Access denied: $e';
-      });
+      if (!isReconnect) setState(() => _connecting = false);
       _rawSignaling!.dispose();
       _rawSignaling = null;
+      // A wrong/rejected access code won't fix itself by retrying, so treat
+      // it as final rather than entering the retry loop.
+      setState(() {
+        _status = 'Access denied: $e';
+        _connected = false;
+        _autoRetrying = false;
+      });
       return;
     }
+
+    // Credentials work — remember this IP so it doesn't need retyping, and
+    // reset the reconnect countdown now that we're actually back online.
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(kLastIpPrefKey, ip);
+    _reconnectDeadline = null;
 
     _secureSignaling = secure;
 
@@ -122,14 +157,26 @@ class _ClientScreenState extends State<ClientScreen> {
       };
     };
 
+    _pc!.onConnectionState = (state) {
+      if (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
+          state == RTCPeerConnectionState.RTCPeerConnectionStateClosed ||
+          state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+        _handleUnexpectedDisconnect();
+      }
+    };
+
     _secureSub = _secureSignaling!.secureMessages.listen(_handleSignalingMessage);
+
+    _socket!.done.then((_) => _handleUnexpectedDisconnect()).catchError((_) => _handleUnexpectedDisconnect());
 
     setState(() {
       _connecting = false;
       _connected = true;
+      _autoRetrying = false;
       _status = 'Access code verified. Negotiating stream...';
     });
 
+    await WakelockPlus.enable();
     if (_stayActive) {
       await KeepAliveService.start(
         title: 'Video Monitor — Connected',
@@ -165,6 +212,66 @@ class _ClientScreenState extends State<ClientScreen> {
     showDetectionPopup(context, event);
   }
 
+  /// Called when the socket or the WebRTC connection drops without the user
+  /// having pressed Disconnect. Tears down the dead connection and retries
+  /// every few seconds for up to [kReconnectGiveUpTimeout] before giving up.
+  Future<void> _handleUnexpectedDisconnect() async {
+    if (_manualDisconnect || !mounted) return;
+    if (_reconnectTimer != null) return; // already retrying, don't double-schedule
+
+    await _teardownConnection();
+
+    _reconnectDeadline ??= DateTime.now().add(kReconnectGiveUpTimeout);
+    if (DateTime.now().isAfter(_reconnectDeadline!)) {
+      _reconnectDeadline = null;
+      await WakelockPlus.disable();
+      await KeepAliveService.stop();
+      if (mounted) {
+        setState(() {
+          _connected = false;
+          _autoRetrying = false;
+          _status = 'Lost connection and could not reconnect within 5 minutes.';
+        });
+      }
+      return;
+    }
+
+    final remaining = _reconnectDeadline!.difference(DateTime.now());
+    if (mounted) {
+      setState(() {
+        _connected = false;
+        _autoRetrying = true;
+        _status = 'Connection lost — retrying (giving up in ${remaining.inMinutes + 1} min)...';
+      });
+    }
+    _reconnectTimer = Timer(kReconnectRetryInterval, () {
+      _reconnectTimer = null;
+      _connect(isReconnect: true);
+    });
+  }
+
+  void _scheduleReconnectOrGiveUp(String failureStatus) {
+    if (_manualDisconnect) return;
+    setState(() => _status = failureStatus);
+    _handleUnexpectedDisconnect();
+  }
+
+  /// Closes the current socket/peer connection resources without touching
+  /// the manual-disconnect flag or UI text fields, so a retry can reuse them.
+  Future<void> _teardownConnection() async {
+    await _secureSub?.cancel();
+    _secureSub = null;
+    _secureSignaling = null;
+    await _eventsChannel?.close();
+    _eventsChannel = null;
+    await _pc?.close();
+    _pc = null;
+    _rawSignaling?.dispose();
+    _rawSignaling = null;
+    _socket?.destroy();
+    _socket = null;
+  }
+
   Future<void> _onStayActiveToggled(bool value) async {
     setState(() => _stayActive = value);
     if (value && _connected) {
@@ -178,18 +285,16 @@ class _ClientScreenState extends State<ClientScreen> {
   }
 
   Future<void> _disconnect() async {
-    await _secureSub?.cancel();
-    _secureSub = null;
-    _secureSignaling = null;
-    await _eventsChannel?.close();
-    await _pc?.close();
-    _rawSignaling?.dispose();
-    _rawSignaling = null;
-    _socket?.destroy();
-    _socket = null;
+    _manualDisconnect = true;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectDeadline = null;
+    await _teardownConnection();
     await KeepAliveService.stop();
+    await WakelockPlus.disable();
     setState(() {
       _connected = false;
+      _autoRetrying = false;
       _status = 'Disconnected';
       _remoteRenderer.srcObject = null;
     });
@@ -201,7 +306,10 @@ class _ClientScreenState extends State<ClientScreen> {
 
   @override
   void dispose() {
-    _disconnect();
+    _manualDisconnect = true;
+    _reconnectTimer?.cancel();
+    _teardownConnection();
+    WakelockPlus.disable();
     _remoteRenderer.dispose();
     _ipController.dispose();
     _accessCodeController.dispose();
@@ -210,6 +318,7 @@ class _ClientScreenState extends State<ClientScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final showFields = !_connected && !_autoRetrying;
     return Scaffold(
       appBar: AppBar(title: const Text('Client')),
       body: ListView(
@@ -243,7 +352,7 @@ class _ClientScreenState extends State<ClientScreen> {
           const SizedBox(height: 12),
           Text(_status, style: const TextStyle(fontWeight: FontWeight.bold)),
           const SizedBox(height: 16),
-          if (!_connected) ...[
+          if (showFields) ...[
             TextField(
               controller: _ipController,
               decoration: const InputDecoration(
@@ -269,7 +378,8 @@ class _ClientScreenState extends State<ClientScreen> {
               contentPadding: EdgeInsets.zero,
               title: const Text('Stay active over other apps'),
               subtitle: const Text(
-                'Keeps the connection alive if you switch apps or lock the screen (Android only).',
+                'Keeps the screen on and the connection alive if you switch '
+                'apps or lock the screen (Android only).',
                 style: TextStyle(fontSize: 12),
               ),
               value: _stayActive,
@@ -295,7 +405,8 @@ class _ClientScreenState extends State<ClientScreen> {
               contentPadding: EdgeInsets.zero,
               title: const Text('Stay active over other apps'),
               subtitle: const Text(
-                'Keeps the connection alive if you switch apps or lock the screen (Android only).',
+                'Keeps the screen on and the connection alive if you switch '
+                'apps or lock the screen (Android only).',
                 style: TextStyle(fontSize: 12),
               ),
               value: _stayActive,
@@ -306,7 +417,7 @@ class _ClientScreenState extends State<ClientScreen> {
               width: double.infinity,
               child: OutlinedButton.icon(
                 icon: const Icon(Icons.link_off),
-                label: const Text('Disconnect'),
+                label: Text(_autoRetrying ? 'Stop retrying' : 'Disconnect'),
                 onPressed: _disconnect,
               ),
             ),
@@ -326,4 +437,3 @@ class _ClientScreenState extends State<ClientScreen> {
     );
   }
 }
-

@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../models/detection_event.dart';
 import '../services/keep_alive_service.dart';
@@ -17,9 +18,6 @@ import '../services/signaling.dart';
 import '../services/sound_detector.dart';
 import '../services/webrtc_service.dart';
 import '../widgets/fullscreen_video.dart';
-
-/// Idle time with zero connected clients before the server auto-stops.
-const Duration kIdleShutdownTimeout = Duration(minutes: 1);
 
 /// Everything associated with one connected viewer: its raw + encrypted
 /// signaling channel, its own RTCPeerConnection (WebRTC here is a mesh —
@@ -79,10 +77,6 @@ class _ServerScreenState extends State<ServerScreen> {
   double? _currentDb;
   final List<DetectionEvent> _log = [];
 
-  Timer? _idleShutdownTimer;
-  bool _hadAnyClient = false;
-  DateTime? _idleSince;
-
   bool get _serverRunning => _localStream != null;
 
   @override
@@ -125,18 +119,14 @@ class _ServerScreenState extends State<ServerScreen> {
     // clients are watching, and fans out alerts to every connected client.
     _startDetectors();
 
-    // Keep the app process alive (Android) for as long as the server is
-    // running, regardless of whether anyone is currently watching, so the
-    // OS doesn't kill it while backgrounded or the screen is locked.
+    // Keep the app process alive (Android) and the screen from sleeping for
+    // as long as the server is running — it never auto-stops on its own;
+    // only pressing Stop below ends the session.
     await KeepAliveService.start(
       title: 'Video Monitor — Server running',
       text: 'Waiting for clients on $_localIp:$defaultSignalingPort',
     );
-
-    _hadAnyClient = false;
-    _idleShutdownTimer?.cancel();
-    _idleShutdownTimer = null;
-    _idleSince = null;
+    await WakelockPlus.enable();
 
     setState(() => _status =
         'Listening on $_localIp:$defaultSignalingPort  •  Access code: ${_accessCodeController.text}');
@@ -174,12 +164,6 @@ class _ServerScreenState extends State<ServerScreen> {
       label: remote,
     );
     _sessions[id] = session;
-
-    // A live client showed up — cancel any pending auto-shutdown.
-    _hadAnyClient = true;
-    _idleSince = null;
-    _idleShutdownTimer?.cancel();
-    _idleShutdownTimer = null;
 
     final eventsChannel = await pc.createDataChannel('events', RTCDataChannelInit()..ordered = true);
     session.eventsChannel = eventsChannel;
@@ -239,28 +223,15 @@ class _ServerScreenState extends State<ServerScreen> {
     session?.dispose();
     if (!mounted) return;
 
-    if (_sessions.isEmpty && _hadAnyClient && _serverRunning) {
-      // Last viewer just left: start the 1-minute countdown. The server
-      // keeps streaming/recording/detecting the whole time — only the
-      // signaling listener + camera/mic session get torn down if nobody
-      // reconnects before the timer fires.
-      _idleSince = DateTime.now();
-      _idleShutdownTimer?.cancel();
-      _idleShutdownTimer = Timer(kIdleShutdownTimeout, _onIdleTimeout);
-    }
-
+    // No auto-shutdown here: the server (camera, mic, detectors, listening
+    // socket) keeps running with zero clients for as long as you like.
+    // Only the Stop button below ends the session.
     setState(() => _status = _serverRunning
         ? (_sessions.isEmpty
-            ? '0 clients connected. Auto-stopping in 1 minute if none reconnect...'
+            ? 'Streaming, waiting for a client on $_localIp:$defaultSignalingPort'
             : '${_sessions.length} client(s) connected.')
         : 'Stopped');
     _updateKeepAliveNotification();
-  }
-
-  void _onIdleTimeout() {
-    if (!_serverRunning || _sessions.isNotEmpty) return;
-    setState(() => _status = 'No clients for over a minute — stopping automatically.');
-    _stopServer();
   }
 
   void _updateKeepAliveNotification() {
@@ -333,10 +304,6 @@ class _ServerScreenState extends State<ServerScreen> {
   Future<void> _stopServer() async {
     _soundDetector?.stop();
     _motionDetector?.stop();
-    _idleShutdownTimer?.cancel();
-    _idleShutdownTimer = null;
-    _hadAnyClient = false;
-    _idleSince = null;
     for (final session in _sessions.values.toList()) {
       await session.dispose();
     }
@@ -346,6 +313,7 @@ class _ServerScreenState extends State<ServerScreen> {
     _localStream?.getTracks().forEach((t) => t.stop());
     _localStream = null;
     await KeepAliveService.stop();
+    await WakelockPlus.disable();
     setState(() => _status = 'Stopped');
   }
 
@@ -457,9 +425,10 @@ class _ServerScreenState extends State<ServerScreen> {
           ),
           const SizedBox(height: 8),
           const Text(
-            'The app keeps a persistent notification (Android) while the server '
-            'is running, so it stays alive if you switch apps or lock the screen. '
-            'If no client is connected for 1 minute, it stops automatically.',
+            'The server never disconnects on its own: it keeps the camera/mic '
+            'session, a persistent notification (Android), and the screen awake '
+            'for as long as it runs, whether or not a client is connected. '
+            'Only the Stop button above ends it.',
             style: TextStyle(color: Colors.white70, fontSize: 12),
           ),
           const SizedBox(height: 24),
