@@ -10,10 +10,12 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../models/detection_event.dart';
+import '../services/keep_alive_service.dart';
 import '../services/secure_channel.dart';
 import '../services/signaling.dart';
 import '../services/webrtc_service.dart';
 import '../widgets/alert_popup.dart';
+import '../widgets/fullscreen_video.dart';
 
 class ClientScreen extends StatefulWidget {
   const ClientScreen({super.key});
@@ -37,6 +39,7 @@ class _ClientScreenState extends State<ClientScreen> {
   String _status = 'Not connected';
   bool _connecting = false;
   bool _connected = false;
+  bool _stayActive = false;
   final List<DetectionEvent> _log = [];
 
   @override
@@ -126,6 +129,13 @@ class _ClientScreenState extends State<ClientScreen> {
       _connected = true;
       _status = 'Access code verified. Negotiating stream...';
     });
+
+    if (_stayActive) {
+      await KeepAliveService.start(
+        title: 'Video Monitor — Connected',
+        text: 'Watching the stream from $ip in the background',
+      );
+    }
   }
 
   Future<void> _handleSignalingMessage(Map<String, dynamic> msg) async {
@@ -155,6 +165,18 @@ class _ClientScreenState extends State<ClientScreen> {
     showDetectionPopup(context, event);
   }
 
+  Future<void> _onStayActiveToggled(bool value) async {
+    setState(() => _stayActive = value);
+    if (value && _connected) {
+      await KeepAliveService.start(
+        title: 'Video Monitor — Connected',
+        text: 'Watching the stream in the background',
+      );
+    } else if (!value) {
+      await KeepAliveService.stop();
+    }
+  }
+
   Future<void> _disconnect() async {
     await _secureSub?.cancel();
     _secureSub = null;
@@ -165,11 +187,16 @@ class _ClientScreenState extends State<ClientScreen> {
     _rawSignaling = null;
     _socket?.destroy();
     _socket = null;
+    await KeepAliveService.stop();
     setState(() {
       _connected = false;
       _status = 'Disconnected';
       _remoteRenderer.srcObject = null;
     });
+  }
+
+  Future<void> _openFullscreen() {
+    return showFullscreenVideo(context, renderer: _remoteRenderer, label: 'Live stream');
   }
 
   @override
@@ -192,9 +219,24 @@ class _ClientScreenState extends State<ClientScreen> {
             aspectRatio: 16 / 9,
             child: ClipRRect(
               borderRadius: BorderRadius.circular(12),
-              child: Container(
-                color: Colors.black,
-                child: RTCVideoView(_remoteRenderer),
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  Container(
+                    color: Colors.black,
+                    child: RTCVideoView(_remoteRenderer),
+                  ),
+                  if (_connected)
+                    Positioned(
+                      right: 8,
+                      bottom: 8,
+                      child: IconButton.filledTonal(
+                        icon: const Icon(Icons.fullscreen),
+                        tooltip: 'Fullscreen',
+                        onPressed: _openFullscreen,
+                      ),
+                    ),
+                ],
               ),
             ),
           ),
@@ -222,7 +264,18 @@ class _ClientScreenState extends State<ClientScreen> {
               keyboardType: TextInputType.number,
               obscureText: true,
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 4),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Stay active over other apps'),
+              subtitle: const Text(
+                'Keeps the connection alive if you switch apps or lock the screen (Android only).',
+                style: TextStyle(fontSize: 12),
+              ),
+              value: _stayActive,
+              onChanged: _onStayActiveToggled,
+            ),
+            const SizedBox(height: 8),
             SizedBox(
               width: double.infinity,
               height: 48,
@@ -237,7 +290,18 @@ class _ClientScreenState extends State<ClientScreen> {
                     : const Text('Connect'),
               ),
             ),
-          ] else
+          ] else ...[
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Stay active over other apps'),
+              subtitle: const Text(
+                'Keeps the connection alive if you switch apps or lock the screen (Android only).',
+                style: TextStyle(fontSize: 12),
+              ),
+              value: _stayActive,
+              onChanged: _onStayActiveToggled,
+            ),
+            const SizedBox(height: 8),
             SizedBox(
               width: double.infinity,
               child: OutlinedButton.icon(
@@ -246,6 +310,7 @@ class _ClientScreenState extends State<ClientScreen> {
                 onPressed: _disconnect,
               ),
             ),
+          ],
           const SizedBox(height: 24),
           if (_log.isNotEmpty) ...[
             const Text('Recent alerts', style: TextStyle(fontWeight: FontWeight.bold)),
@@ -261,3 +326,4 @@ class _ClientScreenState extends State<ClientScreen> {
     );
   }
 }
+

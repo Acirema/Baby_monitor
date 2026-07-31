@@ -17,7 +17,9 @@ dependencies:
   noise_meter: ^5.0.1
   network_info_plus: ^5.0.3
   cryptography: ^2.7.0
-
+  record: ^7.1.1
+  path_provider: ^2.1.4
+  flutter_foreground_task: ^9.0.0
 dev_dependencies:
   flutter_test:
     sdk: flutter

@@ -1,4 +1,3 @@
-// Copyright (c) 2026 Your Company/Name.
 // Licensed under the MIT License — see LICENSE for details.
 
 import 'dart:async';
@@ -11,11 +10,16 @@ import 'package:network_info_plus/network_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../models/detection_event.dart';
+import '../services/keep_alive_service.dart';
 import '../services/motion_detector.dart';
 import '../services/secure_channel.dart';
 import '../services/signaling.dart';
 import '../services/sound_detector.dart';
 import '../services/webrtc_service.dart';
+import '../widgets/fullscreen_video.dart';
+
+/// Idle time with zero connected clients before the server auto-stops.
+const Duration kIdleShutdownTimeout = Duration(minutes: 1);
 
 /// Everything associated with one connected viewer: its raw + encrypted
 /// signaling channel, its own RTCPeerConnection (WebRTC here is a mesh —
@@ -75,6 +79,10 @@ class _ServerScreenState extends State<ServerScreen> {
   double? _currentDb;
   final List<DetectionEvent> _log = [];
 
+  Timer? _idleShutdownTimer;
+  bool _hadAnyClient = false;
+  DateTime? _idleSince;
+
   bool get _serverRunning => _localStream != null;
 
   @override
@@ -108,12 +116,27 @@ class _ServerScreenState extends State<ServerScreen> {
       _serverSocket = await ServerSocket.bind(InternetAddress.anyIPv4, defaultSignalingPort);
     } catch (e) {
       setState(() => _status = 'Failed to open port $defaultSignalingPort: $e');
+      _localStream?.getTracks().forEach((t) => t.stop());
+      _localStream = null;
       return;
     }
 
     // Detection runs once for the whole server, independent of how many
     // clients are watching, and fans out alerts to every connected client.
     _startDetectors();
+
+    // Keep the app process alive (Android) for as long as the server is
+    // running, regardless of whether anyone is currently watching, so the
+    // OS doesn't kill it while backgrounded or the screen is locked.
+    await KeepAliveService.start(
+      title: 'Video Monitor — Server running',
+      text: 'Waiting for clients on $_localIp:$defaultSignalingPort',
+    );
+
+    _hadAnyClient = false;
+    _idleShutdownTimer?.cancel();
+    _idleShutdownTimer = null;
+    _idleSince = null;
 
     setState(() => _status =
         'Listening on $_localIp:$defaultSignalingPort  •  Access code: ${_accessCodeController.text}');
@@ -152,11 +175,18 @@ class _ServerScreenState extends State<ServerScreen> {
     );
     _sessions[id] = session;
 
+    // A live client showed up — cancel any pending auto-shutdown.
+    _hadAnyClient = true;
+    _idleSince = null;
+    _idleShutdownTimer?.cancel();
+    _idleShutdownTimer = null;
+
     final eventsChannel = await pc.createDataChannel('events', RTCDataChannelInit()..ordered = true);
     session.eventsChannel = eventsChannel;
     eventsChannel.onDataChannelState = (state) {
       if (state == RTCDataChannelState.RTCDataChannelOpen && mounted) {
         setState(() => _status = '${_sessions.length} client(s) connected. Streaming (encrypted).');
+        _updateKeepAliveNotification();
       }
     };
 
@@ -207,11 +237,40 @@ class _ServerScreenState extends State<ServerScreen> {
   void _removeSession(String id) {
     final session = _sessions.remove(id);
     session?.dispose();
-    if (mounted) {
-      setState(() => _status = _serverRunning
-          ? '${_sessions.length} client(s) connected. Waiting for more on $_localIp:$defaultSignalingPort'
-          : 'Stopped');
+    if (!mounted) return;
+
+    if (_sessions.isEmpty && _hadAnyClient && _serverRunning) {
+      // Last viewer just left: start the 1-minute countdown. The server
+      // keeps streaming/recording/detecting the whole time — only the
+      // signaling listener + camera/mic session get torn down if nobody
+      // reconnects before the timer fires.
+      _idleSince = DateTime.now();
+      _idleShutdownTimer?.cancel();
+      _idleShutdownTimer = Timer(kIdleShutdownTimeout, _onIdleTimeout);
     }
+
+    setState(() => _status = _serverRunning
+        ? (_sessions.isEmpty
+            ? '0 clients connected. Auto-stopping in 1 minute if none reconnect...'
+            : '${_sessions.length} client(s) connected.')
+        : 'Stopped');
+    _updateKeepAliveNotification();
+  }
+
+  void _onIdleTimeout() {
+    if (!_serverRunning || _sessions.isNotEmpty) return;
+    setState(() => _status = 'No clients for over a minute — stopping automatically.');
+    _stopServer();
+  }
+
+  void _updateKeepAliveNotification() {
+    if (!_serverRunning) return;
+    KeepAliveService.update(
+      title: 'Video Monitor — Server running',
+      text: _sessions.isEmpty
+          ? 'Waiting for clients on $_localIp:$defaultSignalingPort'
+          : '${_sessions.length} client(s) connected',
+    );
   }
 
   void _startDetectors() {
@@ -274,6 +333,10 @@ class _ServerScreenState extends State<ServerScreen> {
   Future<void> _stopServer() async {
     _soundDetector?.stop();
     _motionDetector?.stop();
+    _idleShutdownTimer?.cancel();
+    _idleShutdownTimer = null;
+    _hadAnyClient = false;
+    _idleSince = null;
     for (final session in _sessions.values.toList()) {
       await session.dispose();
     }
@@ -282,7 +345,12 @@ class _ServerScreenState extends State<ServerScreen> {
     _serverSocket = null;
     _localStream?.getTracks().forEach((t) => t.stop());
     _localStream = null;
+    await KeepAliveService.stop();
     setState(() => _status = 'Stopped');
+  }
+
+  Future<void> _openFullscreen() {
+    return showFullscreenVideo(context, renderer: _localRenderer, label: 'Server camera preview');
   }
 
   @override
@@ -304,9 +372,24 @@ class _ServerScreenState extends State<ServerScreen> {
             aspectRatio: 16 / 9,
             child: ClipRRect(
               borderRadius: BorderRadius.circular(12),
-              child: Container(
-                color: Colors.black,
-                child: RTCVideoView(_localRenderer, mirror: false),
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  Container(
+                    color: Colors.black,
+                    child: RTCVideoView(_localRenderer, mirror: false),
+                  ),
+                  if (_serverRunning)
+                    Positioned(
+                      right: 8,
+                      bottom: 8,
+                      child: IconButton.filledTonal(
+                        icon: const Icon(Icons.fullscreen),
+                        tooltip: 'Fullscreen',
+                        onPressed: _openFullscreen,
+                      ),
+                    ),
+                ],
               ),
             ),
           ),
@@ -371,6 +454,13 @@ class _ServerScreenState extends State<ServerScreen> {
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'The app keeps a persistent notification (Android) while the server '
+            'is running, so it stays alive if you switch apps or lock the screen. '
+            'If no client is connected for 1 minute, it stops automatically.',
+            style: TextStyle(color: Colors.white70, fontSize: 12),
           ),
           const SizedBox(height: 24),
           Card(
@@ -466,3 +556,4 @@ class _ServerScreenState extends State<ServerScreen> {
     );
   }
 }
+
