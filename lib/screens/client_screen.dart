@@ -6,7 +6,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
-import 'package:permission_handler/permission_handler.dart';
+import 'package:floating/floating.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
@@ -35,6 +35,7 @@ class _ClientScreenState extends State<ClientScreen> {
   final _ipController = TextEditingController();
   final _accessCodeController = TextEditingController();
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
+  final Floating _floating = Floating();
 
   Socket? _socket;
   SignalingSocket? _rawSignaling;
@@ -57,7 +58,6 @@ class _ClientScreenState extends State<ClientScreen> {
   void initState() {
     super.initState();
     _remoteRenderer.initialize();
-    Permission.microphone.request(); // for playback audio focus on some platforms
     _loadLastIp();
   }
 
@@ -183,6 +183,7 @@ class _ClientScreenState extends State<ClientScreen> {
         text: 'Watching the stream from $ip in the background',
       );
     }
+    await _updatePiPEnablement();
   }
 
   Future<void> _handleSignalingMessage(Map<String, dynamic> msg) async {
@@ -233,6 +234,7 @@ class _ClientScreenState extends State<ClientScreen> {
           _status = 'Lost connection and could not reconnect within 5 minutes.';
         });
       }
+      await _updatePiPEnablement();
       return;
     }
 
@@ -272,6 +274,23 @@ class _ClientScreenState extends State<ClientScreen> {
     _socket = null;
   }
 
+  /// Keeps the Android Picture-in-Picture auto-trigger in sync with whether
+  /// the user wants to "stay active" and whether we're actually connected.
+  /// When both are true, minimizing the app (home button / app switch) will
+  /// shrink it into a small corner window showing just the video — see
+  /// [_buildPiPView]. No-op on non-Android platforms.
+  Future<void> _updatePiPEnablement() async {
+    if (!Platform.isAndroid) return;
+    if (_stayActive && _connected) {
+      final available = await _floating.isPipAvailable;
+      if (available) {
+        await _floating.enable(const OnLeavePiP());
+      }
+    } else {
+      await _floating.cancelOnLeavePiP();
+    }
+  }
+
   Future<void> _onStayActiveToggled(bool value) async {
     setState(() => _stayActive = value);
     if (value && _connected) {
@@ -282,6 +301,7 @@ class _ClientScreenState extends State<ClientScreen> {
     } else if (!value) {
       await KeepAliveService.stop();
     }
+    await _updatePiPEnablement();
   }
 
   Future<void> _disconnect() async {
@@ -298,10 +318,20 @@ class _ClientScreenState extends State<ClientScreen> {
       _status = 'Disconnected';
       _remoteRenderer.srcObject = null;
     });
+    await _updatePiPEnablement();
   }
 
   Future<void> _openFullscreen() {
     return showFullscreenVideo(context, renderer: _remoteRenderer, label: 'Live stream');
+  }
+
+  /// What's shown inside the small Android PiP corner window: just the
+  /// video, no app bar, no buttons, no text — exactly what was asked for.
+  Widget _buildPiPView() {
+    return Container(
+      color: Colors.black,
+      child: RTCVideoView(_remoteRenderer),
+    );
   }
 
   @override
@@ -310,6 +340,7 @@ class _ClientScreenState extends State<ClientScreen> {
     _reconnectTimer?.cancel();
     _teardownConnection();
     WakelockPlus.disable();
+    if (Platform.isAndroid) _floating.cancelOnLeavePiP();
     _remoteRenderer.dispose();
     _ipController.dispose();
     _accessCodeController.dispose();
@@ -318,6 +349,13 @@ class _ClientScreenState extends State<ClientScreen> {
 
   @override
   Widget build(BuildContext context) {
+    return PiPSwitcher(
+      childWhenDisabled: _buildFullUI(context),
+      childWhenEnabled: _buildPiPView(),
+    );
+  }
+
+  Widget _buildFullUI(BuildContext context) {
     final showFields = !_connected && !_autoRetrying;
     return Scaffold(
       appBar: AppBar(title: const Text('Client')),
@@ -378,8 +416,8 @@ class _ClientScreenState extends State<ClientScreen> {
               contentPadding: EdgeInsets.zero,
               title: const Text('Stay active over other apps'),
               subtitle: const Text(
-                'Keeps the screen on and the connection alive if you switch '
-                'apps or lock the screen (Android only).',
+                'Keeps the screen on, the connection alive, and shows a small '
+                'video-only corner window when you switch apps (Android only).',
                 style: TextStyle(fontSize: 12),
               ),
               value: _stayActive,
@@ -405,8 +443,8 @@ class _ClientScreenState extends State<ClientScreen> {
               contentPadding: EdgeInsets.zero,
               title: const Text('Stay active over other apps'),
               subtitle: const Text(
-                'Keeps the screen on and the connection alive if you switch '
-                'apps or lock the screen (Android only).',
+                'Keeps the screen on, the connection alive, and shows a small '
+                'video-only corner window when you switch apps (Android only).',
                 style: TextStyle(fontSize: 12),
               ),
               value: _stayActive,

@@ -72,6 +72,7 @@ class _ServerScreenState extends State<ServerScreen> {
   String _status = 'Idle';
   String? _localIp;
   bool _motionEnabled = false;
+  bool _keepScreenOn = true;
   double _soundThreshold = 70;
   double _motionSensitivity = 0.03;
   double? _currentDb;
@@ -126,7 +127,7 @@ class _ServerScreenState extends State<ServerScreen> {
       title: 'Video Monitor — Server running',
       text: 'Waiting for clients on $_localIp:$defaultSignalingPort',
     );
-    await WakelockPlus.enable();
+    if (_keepScreenOn) await WakelockPlus.enable();
 
     setState(() => _status =
         'Listening on $_localIp:$defaultSignalingPort  •  Access code: ${_accessCodeController.text}');
@@ -297,6 +298,17 @@ class _ServerScreenState extends State<ServerScreen> {
     setState(() => _accessCodeController.text = generateAccessCode());
   }
 
+  Future<void> _toggleKeepScreenOn(bool value) async {
+    setState(() => _keepScreenOn = value);
+    if (_serverRunning) {
+      if (value) {
+        await WakelockPlus.enable();
+      } else {
+        await WakelockPlus.disable();
+      }
+    }
+  }
+
   Future<void> _disconnectClient(String id) async {
     _removeSession(id);
   }
@@ -426,10 +438,35 @@ class _ServerScreenState extends State<ServerScreen> {
           const SizedBox(height: 8),
           const Text(
             'The server never disconnects on its own: it keeps the camera/mic '
-            'session, a persistent notification (Android), and the screen awake '
-            'for as long as it runs, whether or not a client is connected. '
-            'Only the Stop button above ends it.',
+            'session, the listening socket, and (on Android) a persistent '
+            'notification running for as long as it\'s on, whether or not a '
+            'client is connected. Only the Stop button above ends it.',
             style: TextStyle(color: Colors.white70, fontSize: 12),
+          ),
+          const SizedBox(height: 16),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Power', style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Turning this off lets the display sleep to save battery. '
+                    'The stream, detection, and the Android background service '
+                    'keep running regardless — only the screen goes dark.',
+                    style: TextStyle(color: Colors.white70, fontSize: 12),
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Keep screen on'),
+                    value: _keepScreenOn,
+                    onChanged: _toggleKeepScreenOn,
+                  ),
+                ],
+              ),
+            ),
           ),
           const SizedBox(height: 24),
           Card(
@@ -525,4 +562,3 @@ class _ServerScreenState extends State<ServerScreen> {
     );
   }
 }
-
